@@ -1,6 +1,5 @@
 import os
 import sys
-import uuid
 cuda_num = 3
 os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_num)
 sys.path.append('third_party/Matcha-TTS')
@@ -272,7 +271,7 @@ Here is an example of how the integrated data might look:
 {"start": 0, "end": 15},
 {"start": 105, "end": 125},
 {"start": 175, "end": 185},
-{"start": 225", "end": 240},
+{"start": 225, "end": 240},
 {"start": 270, "end": 290},
 {"start": 455, "end": 505},
 {"start": 575, "end": 620}

@@ -1,6 +1,5 @@
 import os
 import sys
-import uuid
 cuda_num = 3
 os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_num)
 sys.path.append('third_party/Matcha-TTS')
