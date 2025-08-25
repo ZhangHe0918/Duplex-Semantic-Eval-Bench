@@ -122,7 +122,7 @@ from flow_inference import AudioDecoder
 #     )
 #     create_stereo_file(user_speech.cpu(), model_speech.cpu(), stereo_output_path)
 
-def majority_voting_turns(results_list: List[Dict], overlap_threshold: float = 0.5):
+def majority_voting_turns(results_list: List[Dict], overlap_threshold: float = 0.5, model_ipus: List[Dict] = None):
     """
     Use majority voting to get stable turn segmentation results
     
@@ -150,29 +150,34 @@ def majority_voting_turns(results_list: List[Dict], overlap_threshold: float = 0
         return overlap_duration / union_duration if union_duration > 0 else 0
     
     def merge_similar_turns(turns, threshold):
-        """Merge turns that have high overlap"""
-        merged_turns = []
-        
+        """Merge turns that have high overlap using median boundaries ."""
+        clusters = []  # each: {'starts': [...], 'ends': [...], 'count': int}
+
         for turn in turns:
             merged = False
-            for i, existing_turn in enumerate(merged_turns):
-                if calculate_overlap(turn, existing_turn) >= threshold:
-                    # Merge by taking average boundaries
-                    merged_turns[i] = {
-                        'start': (turn['start'] + existing_turn['start']) / 2,
-                        'end': (turn['end'] + existing_turn['end']) / 2,
-                        'count': existing_turn.get('count', 1) + 1
-                    }
+            for cluster in clusters:
+                # form a temporary representative for overlap check (median if available, else current first)
+                rep_start = sorted(cluster['starts'])[len(cluster['starts']) // 2]
+                rep_end = sorted(cluster['ends'])[len(cluster['ends']) // 2]
+                rep = {'start': rep_start, 'end': rep_end}
+                if calculate_overlap(turn, rep) >= threshold:
+                    cluster['starts'].append(turn['start'])
+                    cluster['ends'].append(turn['end'])
+                    cluster['count'] += 1
                     merged = True
                     break
-            
             if not merged:
-                merged_turns.append({
-                    'start': turn['start'],
-                    'end': turn['end'],
-                    'count': 1
-                })
-        
+                clusters.append({'starts': [turn['start']], 'ends': [turn['end']], 'count': 1})
+
+        # materialize clusters to merged intervals using medians
+        merged_turns = []
+        for c in clusters:
+            starts_sorted = sorted(c['starts'])
+            ends_sorted = sorted(c['ends'])
+            start_med = starts_sorted[len(starts_sorted) // 2]
+            end_med = ends_sorted[len(ends_sorted) // 2]
+            if start_med < end_med:
+                merged_turns.append({'start': start_med, 'end': end_med, 'count': c['count']})
         return merged_turns
     
     def vote_for_turns(all_turns):
@@ -186,57 +191,60 @@ def majority_voting_turns(results_list: List[Dict], overlap_threshold: float = 0
         if not all_turn_candidates:
             return []
         
-        # Merge similar turns
+        # Merge similar turns (median-based)
         merged_turns = merge_similar_turns(all_turn_candidates, overlap_threshold)
-        
+
         # Filter turns that appear in majority of results
         min_votes = min_votes_num  # Majority threshold
         stable_turns = []
-        
         for turn in merged_turns:
             if turn['count'] >= min_votes:
                 stable_turns.append({
                     'start': round(turn['start'], 2),
                     'end': round(turn['end'], 2)
                 })
-        
-        # Sort by start time
+
+        # Sort by start time and return (no extra overlap modification)
         stable_turns.sort(key=lambda x: x['start'])
         return stable_turns
     
-    def vote_for_continuations(all_continuations):
-        """Apply majority voting for continuation info"""
-        # Collect all continuation info
-        continuation_candidates = defaultdict(list)
-        
-        for result in all_continuations:
-            if 'continuation_info' in result:
-                for cont in result['continuation_info']:
-                    turn_id = cont['current_turn']
-                    continuation_candidates[turn_id].append(cont)
-        
-        stable_continuations = []
-        min_votes = min_votes_num
-        
-        for turn_id, continuations in continuation_candidates.items():
-            if len(continuations) >= min_votes:
-                # Average the times for this turn
-                avg_start = sum(c['start_time_of_continuation_user_turn'] for c in continuations) / len(continuations)
-                avg_end = sum(c['end_time_of_continuation_response'] for c in continuations) / len(continuations)
-                
-                stable_continuations.append({
-                    'current_turn': turn_id,
-                    'start_time_of_continuation_user_turn': round(avg_start, 2),
-                    'end_time_of_continuation_response': round(avg_end, 2)
-                })
-        
-        # Sort by turn id
-        stable_continuations.sort(key=lambda x: x['current_turn'])
-        return stable_continuations
+    def vote_for_continuations(stable_turns, model_ipus_local):
+        """Detect continuation using VAD definition over model IPUs.
+        Definition: If model is speaking at the start of current turn and
+        model is speaking at the end of previous turn, mark continuation and
+        set end time to the end of the model response spanning the current turn start.
+        """
+        if model_ipus_local is None:
+            return []
+
+        def speaking_at(time_point, ipus):
+            for ipu in ipus:
+                # allow inclusive end with small epsilon
+                if ipu['start'] <= time_point <= ipu['end'] + 1e-3:
+                    return ipu
+            return None
+
+        continuations = []
+        for idx in range(1, len(stable_turns)):
+            prev_end = stable_turns[idx - 1]['end']
+            curr_start = stable_turns[idx]['start']
+
+            ipu_prev = speaking_at(prev_end, model_ipus_local)
+            ipu_curr = speaking_at(curr_start, model_ipus_local)
+            if ipu_prev is not None and ipu_curr is not None:
+                # continuation detected; end is current turn's model speaking end
+                end_time = min(ipu_curr['end'], stable_turns[idx]['end'])
+                if curr_start < end_time:
+                    continuations.append({
+                        'current_turn': idx,
+                        'start_time_of_continuation_user_turn': round(curr_start, 2),
+                        'end_time_of_continuation_response': round(end_time, 2)
+                    })
+        return continuations
     
     # Apply majority voting
     stable_filtered_turn = vote_for_turns(results_list)
-    stable_continuation_info = vote_for_continuations(results_list)
+    stable_continuation_info = vote_for_continuations(stable_filtered_turn, model_ipus)
     
     return {
         'filtered_turn': stable_filtered_turn,
@@ -340,6 +348,29 @@ def asr_ts_on_stereo(input_file):
 
     return left_corrected_segments, right_corrected_segments
 
+def extract_model_ipus_from_segments(model_segments):
+    """
+    Build model IPUs list from model-channel ASR segments.
+    model_segments: list of {'timestamp': (start, end), 'text': ...}
+    Returns: list of {'start': float, 'end': float} merged and sorted.
+    """
+    ipus = []
+    if model_segments is None:
+        return ipus
+    for seg in model_segments:
+        start, end = seg['timestamp']
+        if start < end:
+            ipus.append({'start': float(start), 'end': float(end)})
+    ipus.sort(key=lambda x: x['start'])
+    # merge overlapping/adjacent ipus
+    merged = []
+    for ipu in ipus:
+        if not merged or ipu['start'] > merged[-1]['end']:
+            merged.append(ipu)
+        else:
+            merged[-1]['end'] = max(merged[-1]['end'], ipu['end'])
+    return merged
+
 def time_range_to_token_range(start_time, end_time, tokens_per_second=12.5):
         """
         Convert time range to token range.
@@ -436,7 +467,9 @@ for input_file in tqdm(wav_files):
                 result_dict = json.loads(extracted_data)
             print(f"Extracted intergrated data for {input_file}: {result_dict}")
             intergrated_data.append(result_dict)
-        result_data = majority_voting_turns(intergrated_data, overlap_threshold=0.3)
+        # Build model IPUs 
+        model_ipus = extract_model_ipus_from_segments(right_timestamps)
+        result_data = majority_voting_turns(intergrated_data, overlap_threshold=0.3, model_ipus=model_ipus)
         print(f"Extracted intergrated data for {input_file}: {result_data}")
         intergrated_datas[filename] = {
             "transcription": merged_text, 
